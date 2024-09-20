@@ -1,0 +1,42 @@
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Django stuff:
+*.log
+*.pot
+*.pyc
+*.so
+*.swp
+*.swo
+*.swn
+*~
+*.coverage
+.coverage.*
+
+# Django migrations
+*.mo
+*.migrations/
+
+# Environment variables file
+.env.local
+.env.*.local
+
+# SQL database
+*.db
+*.sqlite3
+
+# Static and media files
+staticfiles/
+media/
+
+# Other
+.idea/
+.vscode/
+*.DS_Store
