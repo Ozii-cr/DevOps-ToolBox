@@ -8,9 +8,11 @@ This Dockerfile creates a production-ready Docker image for a Next.js applicatio
 
 2. **Port Configuration**: The default port is set to 6000. You can change this by modifying the `EXPOSE` and `ENV PORT` instructions in the Dockerfile.
 
-3. **Package Manager**: This Dockerfile is configured for pnpm. If your project uses a different package manager (npm or yarn), replace `pnpm-lock.yaml` with the appropriate lock file and adjust the install commands accordingly.
+3. **.dockerignore File**: Use the `.dockerignore file` 
 
-4. **Next.js Configuration**: This Dockerfile requires a specific Next.js configuration to work correctly. In your `next.config.mjs` file, ensure you have the following configuration:
+4. **Package Manager**: This Dockerfile is configured for pnpm. If your project uses a different package manager (npm or yarn), replace `pnpm-lock.yaml` with the appropriate lock file and adjust the install commands accordingly.
+
+5. **Next.js Configuration**: This Dockerfile requires a specific Next.js configuration to work correctly. In your `next.config.mjs` file, ensure you have the following configuration:
 
    ```javascript
    const nextConfig = {
