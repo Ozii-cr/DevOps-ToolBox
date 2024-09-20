@@ -1,0 +1,28 @@
+# Ignore node_modules and other dependencies
+node_modules
+*.log
+
+# Ignore build output
+.next
+out
+
+# Ignore local environment files
+.env.local
+.env.development
+.env.production
+.env.test
+.env.*.local
+.env
+
+# Ignore Docker-related files
+Dockerfile
+.dockerignore
+
+# Ignore Git-related files
+.git
+.gitignore
+
+# Ignore any editor-specific files
+.vscode
+.idea
+*.swp
