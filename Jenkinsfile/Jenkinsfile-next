@@ -1,0 +1,626 @@
+
+//variable to store the failed stage of the pipeline #testt
+def FAILED_STAGE = " "
+
+//Condition to get the Image repository name and container name based on the branch
+def getImageFromBranch(branch) {
+  return branch == 'main' ? 'digimall-backend' : 'digimall-backend-staging'
+}
+
+// Function to get container port based on the branch
+def getPortFromBranch(branch) {
+    return branch == 'main' ? '4500:4500' : '4505:4500'
+}
+
+// Function to get container environment file name based on the branch
+def getEnvFileFromBranch(branch) {
+    return branch == 'main' ? '.env-digimall-backend' : '.env-digimall-backend-staging'
+}
+
+pipeline {
+    agent any
+    options {
+      buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '3')
+      disableConcurrentBuilds()
+    }
+    environment {
+        DOCKER_BUILDKIT = '1'
+        IMAGE_REPO_NAME= getImageFromBranch(env.BRANCH_NAME)
+        IMAGE_TAG='latest'
+        CONTAINER_NAME= getImageFromBranch(env.BRANCH_NAME)
+        CONTAINER_PORT= getPortFromBranch(env.BRANCH_NAME)
+        CONTAINER_ENV= getEnvFileFromBranch(env.BRANCH_NAME)
+        SCANNER_HOME= tool 'sonar-scanner'
+        PAYLOAD_SECRET= credentials('PAYLOAD_SECRET')
+        DATABASE_URI= credentials('DATABASE_URI')
+        RESEND_API_KEY= credentials('RESEND_API_KEY')
+        RESEND_FROM_NAME= credentials('RESEND_FROM_NAME')
+        RESEND_FROM_EMAIL= credentials('RESEND_FROM_EMAIL')
+
+        ALLOWED_ORIGINS= credentials('ALLOWED_ORIGINS')
+        S3_BUCKET_NAME= credentials('S3_BUCKET_NAME')
+        S3_AWS_KEY= credentials('S3_AWS_KEY')
+        S3_AWS_SECRET= credentials('S3_AWS_SECRET')
+        S3_ENDPOINT= credentials('S3_ENDPOINT')
+        PAYSTACK_SECRET_KEY= credentials('PAYSTACK_SECRET_KEY')
+        SONAR_USER= credentials('SONAR_USER')
+        SONAR_PASS= credentials('SONAR_PASS')
+        SONAR_URL= credentials('SONAR_URL')
+        SONAR_API_URL= credentials('SONAR_API_URL')
+        TYPE_TAG='backend'
+        MM_URL= credentials('MM_URL')
+        MM_ICON_URL= credentials('MM_ICON_URL')
+        SONAR_CHANNEL='sonarqube-alerts'
+        TRIVY_CHANNEL='trivy-analysis'
+    }
+
+    stages {
+        //Send Pipeline Status to space based on the branch triggered
+      stage('Pipeline Message') {
+            steps {
+                script {
+                    FAILED_STAGE=env.STAGE_NAME
+                    def MESSAGE_ICON= 'automation'
+
+                    if (env.BRANCH_NAME  == 'main' || env.BRANCH_NAME == 'staging') {
+                        PIPELINE_MESSAGE = "Starting Deployment"
+                    }else {
+                        PIPELINE_MESSAGE = "Starting Pipeline"
+                    }
+
+                    def payload = """
+                    {
+                        "text": "${PIPELINE_MESSAGE} :rocket:",
+                        "username" : "${TYPE_TAG}~${BRANCH_NAME} (${BUILD_NUMBER})",
+                        "icon_url" : "${MM_ICON_URL}"
+                    }
+                    """
+                    // Sending the request to mattermost
+                    sh """
+                    curl -i -X POST -H 'Content-Type: application/json' \
+                        -d '${payload}' ${MM_URL}
+                    """
+                    
+                }
+            }
+      }
+          // Setup node environment
+      stage('Install Dependencies') {
+           tools {
+                   nodejs 'node22'  
+               }
+           steps {
+            script {
+              FAILED_STAGE=env.STAGE_NAME
+              sh '''
+                  npm install -g pnpm
+                  pnpm install
+               '''
+            }
+           }
+      }
+       // Run ESLint to lint the code
+        stage('Lint') {
+           tools {
+                   nodejs 'node22'  
+               }
+            steps {
+              script{
+                FAILED_STAGE=env.STAGE_NAME
+                sh 'pnpm run lint'
+                  
+                def PIPELINE_MESSAGE = "Linting checked"
+                
+                def payload = """
+                {
+                    "text": "${PIPELINE_MESSAGE} :heavy_check_mark:",
+                    "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                    "icon_url" : "${MM_ICON_URL}"
+                }
+                """
+                // Sending the request
+                sh """
+                curl -i -X POST -H 'Content-Type: application/json' \
+                    -d '${payload}' ${MM_URL}
+                """
+
+              }    
+            }
+      }
+
+        //File scanning using Trivy
+      stage('File System Scan') {
+          steps {
+              script{
+                  FAILED_STAGE=env.STAGE_NAME
+                   def trivyExitCode = sh(script: "trivy fs --format table -o trivy-fs-report .", returnStatus: true)
+                   if (trivyExitCode != 0) {
+                       echo "Trivy scan failed with exit code: ${trivyExitCode}, continuing pipeline..."
+                   } else {
+                   // Read the Trivy report
+                   def trivyReport = readFile('trivy-fs-report').trim()
+                   // Remove specific unwanted character
+                   def cleanedReport = trivyReport.replaceAll(/[^a-zA-Z0-9\s:]/, '')
+                   
+                   // extract number of vulnerabilities
+                   def totalNumber = sh(script: "echo '${cleanedReport}' | grep -o 'Total *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                   //def unknownNumber = sh(script: "echo '${cleanedReport}' | grep -o 'UNKNOWN *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                   def lowNumber = sh(script: "echo '${cleanedReport}' | grep -o 'LOW *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                   def mediumNumber = sh(script: "echo '${cleanedReport}' | grep -o 'MEDIUM *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                   def highNumber = sh(script: "echo '${cleanedReport}' | grep -o 'HIGH *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                   def criticalNumber = sh(script: "echo '${cleanedReport}' | grep -o 'CRITICAL *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+
+                   def trivy_payload = """
+                   {
+                       "text": "#### File System Scan \n| Metric             | Value                     |\n|--------------------|---------------------------|\n| TOTAL | ${totalNumber}          |\n| LOW          | ${lowNumber}              |\n| MEDIUM | ${mediumNumber}        |\n| HIGH          | ${highNumber}              |\n| CRITICAL          | ${criticalNumber}              |\n\n[Details](${BUILD_URL})",
+                       "username" : "${TYPE_TAG}~${BRANCH_NAME} (${BUILD_NUMBER})",
+                       "icon_url" : "${MM_ICON_URL}",
+                       "channel" : "${TRIVY_CHANNEL}"
+                   }
+                   """
+                   // Sending the request
+                   sh """
+                   curl -i -X POST -H 'Content-Type: application/json' \
+                       -d '${trivy_payload}' ${MM_URL}
+                   """
+
+                  archiveArtifacts artifacts: 'trivy-fs-report', followSymlinks: false
+                   def criticalNumberInt
+                    try {
+                        criticalNumberInt = criticalNumber ? criticalNumber.toInteger() : 0
+                    } catch (NumberFormatException e) {
+                        echo "Error converting criticalNumber to integer: ${e.message}"
+                        criticalNumberInt = 0  // Default value if conversion fails
+                    }
+                  //abort pipeline if number of vulnerabilites meets condition
+                  if (criticalNumberInt >= 5) {
+                        currentBuild.result = 'ABORTED'
+                        def abortMessage = ""
+                        if (env.BRANCH_NAME  == 'main' || env.BRANCH_NAME == 'staging') {
+                            abortMessage = "Aborted Deployment"
+                        }else {
+                            abortMessage = "Aborted Pipeline"
+                        }
+                        // function to send message to space based on the triggered branch
+
+                        def abort_payload = """
+                        {
+                            "text": "${abortMessage} :warning:\n\n[Details](${BUILD_URL})",
+                            "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                            "icon_url" : "${MM_ICON_URL}"
+                        }
+                        """
+                        // Sending the request
+                        sh """
+                        curl -i -X POST -H 'Content-Type: application/json' \
+                            -d '${abort_payload}' ${MM_URL}
+                        """
+                        error('File system check failed ')
+                  }
+                  //send completion notification
+        
+                  def PIPELINE_MESSAGE = "File scan complete :open_file_folder:"
+
+                  def payload = """
+                  {
+                      "text": "${PIPELINE_MESSAGE} ",
+                      "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                      "icon_url" : "${MM_ICON_URL}"
+                  }
+                  """
+                  // Sending the request
+                  sh """
+                  curl -i -X POST -H 'Content-Type: application/json' \
+                      -d '${payload}' ${MM_URL}
+                  """
+                   }
+               }
+           }
+       }
+
+        //sonarqube analysis
+      stage('SonarQube Analsyis') {
+            when {
+               anyOf {
+                    branch 'sonar'
+               }
+            }
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh ''' ${SCANNER_HOME}/bin/sonar-scanner \
+                           -Dsonar.projectName=digimall-backend \
+                           -Dsonar.projectKey=digimall-backend \
+                           -Dsonar.sources=.  '''
+                }
+            }
+      }
+      //Pass through sonar quality gates
+      stage('Quality Gate Check') {
+          when {
+             anyOf {
+                  branch 'sonar'
+             }
+          }
+          steps {
+              script {
+                FAILED_STAGE=env.STAGE_NAME
+                timeout(time: 5, unit: 'MINUTES') {
+                      //Fetch code coverage from SonarQube
+                      def response = sh(script: """
+                          curl --request GET \
+                          -u  ${SONAR_USER}:${SONAR_PASS}\
+                          --url ${SONAR_API_URL}
+                          """, returnStdout: true).trim()
+                      //format the value gotten into json
+                      def responseJson = readJSON text: "${response}"
+                      //get sonarqube metricss
+                       def newCoverage = responseJson.component.measures.find { it.metric == 'new_coverage' }?.period?.value ?: "N/A"
+                       def newBugs = responseJson.component.measures.find { it.metric == 'new_bugs' }?.period?.value ?: "N/A"
+                       def newCodeSmells = responseJson.component.measures.find { it.metric == 'new_code_smells' }?.period?.value ?: "N/A"
+
+                      //send report to mattermost
+                       def sonar_payload = """
+                       {
+                           "text": "| Metric             | Value                     |\n|--------------------|---------------------------|\n| Code Coverage :satellite_antenna: | ${newCoverage}%          |\n| Bugs :bug:          | ${newBugs}               |\n| Code Smells :mag_right: | ${newCodeSmells}        |\n\n[View Details](${SONAR_URL})",
+                           "username" : "${TYPE_TAG}~${BRANCH_NAME} (${BUILD_NUMBER})",
+                           "icon_url" : "${MM_ICON_URL}",
+                           "channel" : "${SONAR_CHANNEL}"
+                       }
+                       """
+                       // Sending the request
+                       sh """
+                       curl -i -X POST -H 'Content-Type: application/json' \
+                           -d '${sonar_payload}' ${MM_URL}
+                       """
+
+                     //qualiy gate check
+                     def qualityGate = waitForQualityGate()
+                     if (qualityGate.status != 'OK') {
+                      error "Pipeline failed due to quality gate failure: ${qualityGate.status}"
+                      }else{
+
+                      def PIPELINE_MESSAGE = "Quality gate passed :unlock:"
+                      def payload = """
+                      {
+                          "text": "${PIPELINE_MESSAGE}",
+                          "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                          "icon_url" : "${MM_ICON_URL}"
+                      }
+                      """
+                      // Sending the request
+                      sh """
+                      curl -i -X POST -H 'Content-Type: application/json' \
+                          -d '${payload}' ${MM_URL}
+                      """
+                      }
+                  }
+          }
+       }
+      }
+      //Create .env file using credentials
+        stage('Create.env prod file') {
+             when {
+               anyOf {
+                       branch 'main'
+               }
+            }
+            steps {
+                script {
+                 sh '''
+                      echo PAYLOAD_SECRET=${PAYLOAD_SECRET} > .env
+                      echo DATABASE_URI=${DATABASE_URI} >> .env
+                      echo RESEND_FROM_NAME=${RESEND_FROM_NAME} >> .env
+                      echo RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL} >> .env
+                      echo RESEND_API_KEY=${RESEND_API_KEY} >> .env
+                      echo ALLOWED_ORIGINS=${ALLOWED_ORIGINS} >> .env
+                      echo S3_BUCKET_NAME=${S3_BUCKET_NAME} >> .env
+                      echo S3_AWS_KEY=${S3_AWS_KEY} >> .env
+                      echo S3_AWS_SECRET=${S3_AWS_SECRET} >> .env
+                      echo S3_ENDPOINT=${S3_ENDPOINT} >> .env
+                      echo S3_AWS_REGION=${S3_AWS_REGION} >> .env
+                      echo PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY} >> .env
+                  '''
+
+                }
+            }
+        }
+
+        stage('Create.env file') {
+            steps {
+                script {
+                 sh '''
+                      echo PAYLOAD_SECRET=${PAYLOAD_SECRET} > .env
+                      echo DATABASE_URI=${DATABASE_URI} >> .env
+                      echo RESEND_FROM_NAME=${RESEND_FROM_NAME} >> .env
+                      echo RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL} >> .env
+                      echo RESEND_API_KEY=${RESEND_API_KEY} >> .env
+                      echo ALLOWED_ORIGINS=${ALLOWED_ORIGINS} >> .env
+                      echo S3_BUCKET_NAME=${S3_BUCKET_NAME} >> .env
+                      echo S3_AWS_KEY=${S3_AWS_KEY} >> .env
+                      echo S3_AWS_SECRET=${S3_AWS_SECRET} >> .env
+                      echo S3_ENDPOINT=${S3_ENDPOINT} >> .env
+                      echo S3_AWS_REGION=${S3_AWS_REGION} >> .env
+                      echo PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY} >> .env
+                  '''
+
+                }
+            }
+        }
+       
+         // Building Docker image
+        stage('Building image') {
+          when {
+            anyOf {
+                    branch 'main'
+                    branch 'staging'
+            }
+         }
+          steps{
+            withCredentials([
+                string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID'),
+                string(credentialsId: 'aws-region', variable: 'AWS_REGION'),
+                aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-cred', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]){
+            script {
+              FAILED_STAGE=env.STAGE_NAME
+              dockerImage = docker.build("${IMAGE_REPO_NAME}:${IMAGE_TAG}", "--no-cache --secret id=secrets_env,src=./.env .")         
+
+
+              //send completion notification
+              def PIPELINE_MESSAGE = "Docker build complete :whale:"
+
+              def payload = """
+              {
+                  "text": "${PIPELINE_MESSAGE}",
+                  "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                  "icon_url" : "${MM_ICON_URL}"
+              }
+              """
+              // Sending the request
+              sh """
+              curl -i -X POST -H 'Content-Type: application/json' \
+                  -d '${payload}' ${MM_URL}
+              """  
+             
+            }
+                }
+          }
+        }
+
+        stage('Docker Image Scan') {
+             when {
+               anyOf {
+                       branch 'main'
+                       branch 'staging'
+               }
+            }
+            steps {
+              script {
+                FAILED_STAGE=env.STAGE_NAME
+                sh "trivy image --format table -o trivy-image-report ${IMAGE_REPO_NAME}:${IMAGE_TAG}"
+                    //save text report
+                    archiveArtifacts artifacts: 'trivy-image-report', followSymlinks: false
+
+
+                    // Read the Trivy report
+                     def trivyReport = readFile('trivy-image-report').trim()
+                     def cleanedReport = trivyReport.replaceAll(/[^a-zA-Z0-9\s:]/, '')
+
+
+                     // extract number of vulnerabilities
+                     def totalNumber = sh(script: "echo '${cleanedReport}' | grep -o 'Total *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                     def unknownNumber = sh(script: "echo '${cleanedReport}' | grep -o 'UNKNOWN *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                     def lowNumber = sh(script: "echo '${cleanedReport}' | grep -o 'LOW *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                     def mediumNumber = sh(script: "echo '${cleanedReport}' | grep -o 'MEDIUM *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                     def highNumber = sh(script: "echo '${cleanedReport}' | grep -o 'HIGH *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+                     def criticalNumber = sh(script: "echo '${cleanedReport}' | grep -o 'CRITICAL *: *[0-9]*' | awk -F ': *' '{sum += \$2} END {print sum}'", returnStdout: true).trim()
+
+                     def trivy_payload = """
+                     {
+                         "text": "#### Image Scan \n| Metric             | Value                     |\n|--------------------|---------------------------|\n| TOTAL | ${totalNumber}          |\n| LOW          | ${lowNumber}              |\n| MEDIUM | ${mediumNumber}        |\n| HIGH          | ${highNumber}              |\n| CRITICAL          | ${criticalNumber}              |\n\n[Details](${BUILD_URL})",
+                         "username" : "${TYPE_TAG}~${BRANCH_NAME} (${BUILD_NUMBER})",
+                         "icon_url" : "${MM_ICON_URL}",
+                         "channel" : "${TRIVY_CHANNEL}"
+                     }
+                     """
+                     // Sending the request
+                     sh """
+                     curl -i -X POST -H 'Content-Type: application/json' \
+                         -d '${trivy_payload}' ${MM_URL}
+                     """
+                   
+
+                    //Ensure criticalNumber is an integer
+                     def criticalNumberInt
+                    try {
+                        criticalNumberInt = criticalNumber ? criticalNumber.toInteger() : 0
+                    } catch (NumberFormatException e) {
+                        echo "Error converting criticalNumber to integer: ${e.message}"
+                        criticalNumberInt = 0  // Default value if conversion fails
+                    }
+                    //Abort the pipeline if the number of critical security scans meets condition
+                    if (criticalNumberInt >= 5) {
+                          currentBuild.result = 'ABORTED'
+
+                          def abortMessage = ""
+
+                          if (env.BRANCH_NAME  == 'main' || env.BRANCH_NAME == 'staging') {
+                              abortMessage = "Aborted Deployment"
+                          }else {
+                              abortMessage = "Aborted Pipeline"
+                          }
+                          // function to send message to space based on the triggered branch
+                          def abort_payload = """
+                          {
+                              "text": "${abortMessage} :warning:\n\n[Details](${BUILD_URL})",
+                              "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                              "icon_url" : "${MM_ICON_URL}"
+                          }
+                          """
+                          // Sending the request
+                          sh """
+                          curl -i -X POST -H 'Content-Type: application/json' \
+                              -d '${abort_payload}' ${MM_URL}
+                          """
+                          error('Docker Image check failed ')
+                    }
+
+
+                    def PIPELINE_MESSAGE = "Image scan complete :shield:"
+                    def payload = """
+                    {
+                        "text": "${PIPELINE_MESSAGE} ",
+                        "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                        "icon_url" : "${MM_ICON_URL}"
+                    }
+                    """
+                    // Sending the request
+                    sh """
+                    curl -i -X POST -H 'Content-Type: application/json' \
+                        -d '${payload}' ${MM_URL}
+                    """                   
+
+              }
+
+            }
+        }
+        // Uploading Docker image into AWS ECR 
+        stage('Pushing to ECR') {
+         when {
+            anyOf {
+                    branch 'main'
+                    branch 'staging'
+            }
+         }
+         steps{
+            withCredentials([
+                string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID'),
+                string(credentialsId: 'aws-region', variable: 'AWS_REGION'),
+                aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-cred', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                script {
+                    FAILED_STAGE=env.STAGE_NAME
+                      sh '''
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                        docker tag ${IMAGE_REPO_NAME}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}
+                        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}
+                      '''
+
+                      //version track the docker images on deployment
+                     if (env.BRANCH_NAME  == 'main') {
+                        sh '''
+                            docker tag ${IMAGE_REPO_NAME}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:1.${BUILD_NUMBER}
+                            docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:1.${BUILD_NUMBER}
+                        '''
+                    } 
+                }
+                }
+         }
+        }
+         // SSH into deployment server, pull and run contianerr
+        stage('Deploy') {
+          when {
+            anyOf {
+                    branch 'main'
+                    branch 'staging'
+            }
+         }
+         steps{
+         withCredentials([
+                string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID'),
+                string(credentialsId: 'aws-region', variable: 'AWS_REGION'),
+                string(credentialsId: 'ssh-host', variable: 'host'),
+                string(credentialsId: 'ssh-port', variable: 'port'),
+                sshUserPrivateKey(credentialsId: 'ssh-cred', keyFileVariable: 'identity', usernameVariable: 'user'),
+                aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-cred', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                script {
+               //define the remote server
+                   def remote = [
+                   name: 'main-server',
+                   allowAnyHosts: true,
+                   user: user,
+                   identityFile: identity,
+                   port: port.toInteger(),
+                   host: host
+                   ]
+
+                  //login to ECR, pull image, stop container if it exists and run the new container
+                  def commands = [
+                     "aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}",
+                     "aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}",
+                     "aws configure set region ${AWS_REGION}",
+                     "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com",
+                     "docker pull ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}",
+                     "docker stop ${CONTAINER_NAME} || true",
+                     "docker rm ${CONTAINER_NAME} || true",
+                     "docker run -d --restart always --env-file ${CONTAINER_ENV} --name ${CONTAINER_NAME} -p ${CONTAINER_PORT} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}",
+                     "docker system prune --all --force || true"
+                     ]
+      
+                     commands.each { cmd ->
+                     sshCommand(remote: remote, command: cmd)
+                     }
+                }
+
+            }
+          }
+        }
+
+    }
+       post {
+        success {
+            script{
+                def successMessage = ""
+                    if (env.BRANCH_NAME  == 'main' || env.BRANCH_NAME == 'staging') {
+                        successMessage = "Successful Deployment"
+                    }else {
+                        successMessage = "Successful Pipeline"
+                    }
+                def pass_payload = """
+                    {
+                        "text": "[${successMessage}](${BUILD_URL}) :white_check_mark:",
+                        "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                        "icon_url" : "${MM_ICON_URL}"
+                    }
+                    """
+                    // Sending the request
+                    sh """
+                    curl -i -X POST -H 'Content-Type: application/json' \
+                        -d '${pass_payload}' ${MM_URL}
+                    """
+            }
+        }
+       failure {
+            script{
+
+                def failMessage = ""
+                    if (env.BRANCH_NAME  == 'main' || env.BRANCH_NAME == 'staging') {
+                        failMessage = "Failed Deployment"
+                    }else {
+                        failMessage = "Failed Pipeline"
+                    }
+                  def fail_payload = """
+                    {
+                        "text": "${failMessage}~ [${FAILED_STAGE}](${BUILD_URL}) :x:",
+                        "username" : "${BRANCH_NAME} (${BUILD_NUMBER})",
+                        "icon_url" : "${MM_ICON_URL}"
+                    }
+                    """
+                    // Sending the request
+                    sh """
+                    curl -i -X POST -H 'Content-Type: application/json' \
+                        -d '${fail_payload}' ${MM_URL}
+                    """
+            }
+       }
+        always {
+          script{
+                sh '''
+                rm -f .env  || true
+                docker logout ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                '''
+             
+          } 
+             
+        }
+    }
+}
