@@ -39,3 +39,7 @@ config=$(generate_nginx_config "$domain" "$port" "name")
 # Save configuration to a file
 config_file="/etc/nginx/conf.d/$name.conf"
 echo "$config" > "$config_file"
+
+systemctl restart nginx
+
+                
