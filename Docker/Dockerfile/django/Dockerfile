@@ -34,7 +34,11 @@ USER django
 EXPOSE 8100
 ENV PORT=8100
 
-# Run the Django commands to collect static files, make migrations, migrate and start the server
+# Make sure the entrypoint script is executable
+RUN chmod +x /app/entrypoint.sh
 
+# Run entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]
 
-CMD ["sh", "-c", "python manage.py collectstatic --noinput && python manage.py makemigrations && python manage.py migrate && python manage.py runserver 0.0.0.0:8100"]
+# Default command
+CMD ["gunicorn", "--bind", "0.0.0.0:8400", "core.wsgi:application"]
