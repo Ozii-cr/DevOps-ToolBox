@@ -1,0 +1,217 @@
+name: CICD for Digimall backend develop
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+  # pull_request:
+  #   branches:
+  #     - develop
+
+
+jobs:
+
+  lint:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Send Message to Mattermost    
+          uses: mattermost/action-mattermost-notify@master
+          with:
+            MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+            TEXT: |
+              Starting Pipeline :rocket:
+            MATTERMOST_USERNAME: Backend~${{ github.ref_name }} (${{ github.run_number }})
+            MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+        
+        - name: Setup pnpm
+          uses: pnpm/action-setup@v4
+          with:
+            version: 10
+        
+        - name: Set up Node.js
+          uses: actions/setup-node@v4
+          with:
+            node-version: '20'
+            cache: 'pnpm'
+            
+        - name: Install dependencies
+          run: pnpm install
+          
+        - name: Run ESLint
+          id: lint-phase
+          run: pnpm lint
+          continue-on-error: true
+
+        - name: Send Message to Mattermost for lint phase pass
+          if: steps.lint-phase.outcome  == 'success' 
+          uses: mattermost/action-mattermost-notify@master
+          with:
+            MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+            TEXT: |
+              Linting Checked :heavy_check_mark:
+            MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+            MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+
+        - name: Send Message to Mattermost for lint phase fail
+          if: steps.lint-phase.outcome  == 'failure' 
+          uses: mattermost/action-mattermost-notify@master
+          with:
+            MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+            TEXT: |
+             [Linting Failed](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) :x:
+            MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+            MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+
+        - name: Exit pipeline on lint fail
+          if: steps.lint-phase.outcome  == 'failure' 
+          run: |
+            echo "Linting failed. Exiting pipeline."
+            exit 1
+              
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner in fs mode
+        uses: aquasecurity/trivy-action@master
+        id: scan-phase
+        with:
+            scan-type: 'fs'
+            format: 'json'
+            scan-ref: '.'
+            output: 'trivy-fs-report.json'
+        env:
+          TRIVY_SKIP_DB_UPDATE: true
+          TRIVY_SKIP_JAVA_DB_UPDATE: true 
+                
+      - name: Parse vulnerabilities from file system report
+        id: parse-fs
+        run: |
+            HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length // 0' trivy-fs-report.json)
+            CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length // 0' trivy-fs-report.json)
+            LOW_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "LOW")] | length // 0' trivy-fs-report.json)
+            MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length // 0' trivy-fs-report.json)
+            TOTAL_COUNT=$(($HIGH_COUNT + $CRITICAL_COUNT + $LOW_COUNT + $MEDIUM_COUNT))
+
+            echo "::set-output name=high::$HIGH_COUNT"
+            echo "::set-output name=critical::$CRITICAL_COUNT"
+            echo "::set-output name=total::$TOTAL_COUNT"
+            echo "::set-output name=low::$LOW_COUNT"
+            echo "::set-output name=medium::$MEDIUM_COUNT"
+        continue-on-error: true
+      
+      - name: Run trivy scan if vulnerabilites are detected 
+        if: ${{ steps.parse-fs.outputs.high > 1 || steps.parse-fs.outputs.critical > 1 }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'table'
+          output: trivy-fs-report.txt
+        env:
+          TRIVY_SKIP_DB_UPDATE: true
+          TRIVY_SKIP_JAVA_DB_UPDATE: true 
+      
+      - name: Upload Trivy Report to check vulnerabilities
+        if:  ${{ steps.parse-fs.outputs.high > 1 || steps.parse-fs.outputs.critical > 1 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-report
+          path: trivy-fs-report.txt
+  
+      - name: Send Message to Mattermost for Scan phase fail
+        if:  ${{ steps.parse-fs.outputs.high > 1 || steps.parse-fs.outputs.critical > 1 }} 
+        uses: mattermost/action-mattermost-notify@master
+        with:
+          MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+          TEXT: |
+            [File scan Failed](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) :x:
+          MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+          MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+                
+      - name: exit on file scan failure
+        if: ${{ steps.parse-fs.outputs.high > 1 || steps.parse-fs.outputs.critical > 1 }}
+        run: |
+            echo "Scan failed. Exiting pipeline."
+            exit 1     
+
+      - name: Send Message to Mattermost for Scan phase pass
+        if: ${{ steps.parse-fs.outputs.high <= 1 && steps.parse-fs.outputs.critical <= 1 }}
+        uses: mattermost/action-mattermost-notify@master
+        with:
+          MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+          TEXT: |
+            File scan complete :open_file_folder:
+          MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+          MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: lint
+       
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+        
+    - name: Create .env file
+      run: |
+        echo "PAYLOAD_SECRET=${{ secrets.PAYLOAD_SECRET }}" > .env
+        echo "DATABASE_URI=${{ secrets.DATABASE_URI_STAGING }}" >> .env
+        echo "RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}" >> .env
+        echo "RESEND_FROM_EMAIL=${{ secrets.RESEND_FROM_EMAIL }}" >> .env
+        echo "RESEND_FROM_NAME=${{ secrets.RESEND_FROM_NAME }}" >> .env
+        echo "S3_BUCKET_NAME=${{ secrets.S3_BUCKET_NAME }}" >> .env
+        echo "S3_AWS_KEY=${{ secrets.S3_AWS_KEY }}" >> .env
+
+        
+        
+    - name: Build image
+      id: building-main
+      uses: docker/build-push-action@v6
+      with:
+        push: false
+        tags: latest
+        context: .
+      continue-on-error: true
+
+        
+    - name: Send Message to Space on successful build 
+      if:  steps.building-main.outcome == 'success'   
+      uses: mattermost/action-mattermost-notify@master
+      with:
+        MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+        TEXT: |
+          Docker build complete  :whale:
+        MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+        MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+
+    - name: Send Message to Space on successful pipeline 
+      if:  steps.building-main.outcome == 'success'   
+      uses: mattermost/action-mattermost-notify@master
+      with:
+        MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+        TEXT: |
+            [Succesful Pipeline](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) :white_check_mark:
+        MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+        MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+        
+   
+    - name: Send Message to Mattermost on failed build
+      if: steps.building-main.outcome  == 'failure'   
+      uses: mattermost/action-mattermost-notify@master
+      with:
+        MATTERMOST_WEBHOOK_URL: ${{ secrets.MM_WEBHOOK_URL }}
+        TEXT: |
+          [Failed Docker build](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) :x: 
+        MATTERMOST_USERNAME: ${{ github.ref_name }} (${{ github.run_number }})
+        MATTERMOST_ICON_URL: ${{ secrets.MM_URL }}
+                
+
+      
+      
